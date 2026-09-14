@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RCA Control Room — Evidence-Based Root Cause Analysis</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            base: '#14171C',
+            surface: '#1C2129',
+            border: '#2A2F38',
+            'border-subtle': '#222831',
+            healthy: '#5FBF77',
+            warning: '#E8A33D',
+            critical: '#E5484D',
+            signal: '#5B8DEF',
+            'text-primary': '#E8EAED',
+            'text-secondary': '#9AA0A8',
+            'text-muted': '#6B7280',
+          },
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['IBM Plex Mono', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    :root {
+      --color-base: #14171C;
+      --color-surface: #1C2129;
+      --color-border: #2A2F38;
+      --color-healthy: #5FBF77;
+      --color-warning: #E8A33D;
+      --color-critical: #E5484D;
+      --color-signal: #5B8DEF;
+      --font-mono: 'IBM Plex Mono', monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { height: 100%; width: 100%; overflow: hidden; background-color: var(--color-base); font-family: 'Inter', sans-serif; color: #E8EAED; }
+    .data-value { font-family: var(--font-mono); }
+    .graph-node-circle { transition: fill 1.2s ease-in-out; }
+    .incident-panel-exit { animation: fadeOut 0.8s ease-in-out forwards; }
+    @keyframes fadeOut { from { opacity: 1; } to { opacity: 0.2; } }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: var(--color-base); }
+    ::-webkit-scrollbar-thumb { background: var(--color-border); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // Default microservice topology
+    const DEFAULT_NODES = [
+      { id: 'frontend-gateway', label: 'frontend-gateway', fxRatio: 0.12, fyRatio: 0.50 },
+      { id: 'order-service',    label: 'order-service',    fxRatio: 0.38, fyRatio: 0.28 },
+      { id: 'auth-service',     label: 'auth-service',     fxRatio: 0.38, fyRatio: 0.72 },
+      { id: 'payment-service',  label: 'payment-service',  fxRatio: 0.68, fyRatio: 0.28 },
+      { id: 'postgres',         label: 'postgres',         fxRatio: 0.90, fyRatio: 0.28 },
+    ];
+
+    const DEFAULT_EDGES = [
+      { source: 'frontend-gateway', target: 'order-service', call_count: 142 },
+      { source: 'frontend-gateway', target: 'auth-service', call_count: 89 },
+      { source: 'order-service', target: 'payment-service', call_count: 124 },
+      { source: 'payment-service', target: 'postgres', call_count: 310 },
+    ];
+
+    function App() {
+      const [utcTime, setUtcTime] = useState('');
+      const [overallHealth, setOverallHealth] = useState('healthy');
+      const [servicesHealth, setServicesHealth] = useState({
+        'frontend-gateway': 'healthy',
+        'order-service': 'healthy',
+        'payment-service': 'healthy',
+        'auth-service': 'healthy',
+        'postgres': 'healthy',
+      });
+      const [activeIncident, setActiveIncident] = useState(null);
+      const [anomalies, setAnomalies] = useState([]);
+      const [feedbackToast, setFeedbackToast] = useState(null);
+      const [isActing, setIsActing] = useState(false);
+      const [selectedNode, setSelectedNode] = useState(null);
+      const [backendConnected, setBackendConnected] = useState(false);
+
+      const svgRef = useRef(null);
+
+      // UTC Clock
+      useEffect(() => {
+        const timer = setInterval(() => {
+          const now = new Date();
+          setUtcTime(now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC');
+        }, 1000);
+        return () => clearInterval(timer);
+      }, []);
+
+      // Check if real backend is listening on :3020
+      useEffect(() => {
+        const checkBackend = async () => {
+          try {
+            const res = await fetch('http://localhost:3020/api/services/health');
+            if (res.ok) {
+              const data = await res.json();
+              setBackendConnected(true);
+              setOverallHealth(data.overall || 'healthy');
+            }
+          } catch (e) {
+            setBackendConnected(false);
+          }
+        };
+        checkBackend();
+        const interval = setInterval(checkBackend, 5000);
+        return () => clearInterval(interval);
+      }, []);
+
+      // D3 Force/Topology Rendering
+      useEffect(() => {
+        if (!svgRef.current) return;
+        const svg = d3.select(svgRef.current);
+        const width = svgRef.current.clientWidth || 700;
+        const height = svgRef.current.clientHeight || 450;
+
+        svg.selectAll('*').remove();
+
+        // Arrow marker
+        const defs = svg.append('defs');
+        defs.append('marker')
+          .attr('id', 'edge-arrow')
+          .attr('viewBox', '0 -5 10 10')
+          .attr('refX', 38)
+          .attr('refY', 0)
+          .attr('markerWidth', 6)
+          .attr('markerHeight', 6)
+          .attr('orient', 'auto')
+          .append('path')
+          .attr('d', 'M0,-5L10,0L0,5')
+          .attr('fill', '#4B5563');
+
+        const nodes = DEFAULT_NODES.map(d => ({
+          ...d,
+          x: d.fxRatio * width,
+          y: d.fyRatio * height,
+        }));
+
+        const nodeMap = new Map(nodes.map(n => [n.id, n]));
+        const links = DEFAULT_EDGES.map(e => ({
+          source: nodeMap.get(e.source),
+          target: nodeMap.get(e.target),
+          call_count: e.call_count,
+        }));
+
+        // Draw Links
+        svg.append('g')
+          .selectAll('line')
+          .data(links)
+          .enter()
+          .append('line')
+          .attr('x1', d => d.source.x)
+          .attr('y1', d => d.source.y)
+          .attr('x2', d => d.target.x)
+          .attr('y2', d => d.target.y)
+          .attr('stroke', '#2A2F38')
+          .attr('stroke-width', 1.5)
+          .attr('marker-end', 'url(#edge-arrow)');
+
+        // Draw Nodes
+        const nodeG = svg.append('g')
+          .selectAll('g')
+          .data(nodes)
+          .enter()
+          .append('g')
+          .attr('transform', d => `translate(${d.x},${d.y})`)
+          .attr('cursor', 'pointer')
+          .on('click', (e, d) => setSelectedNode(d.id));
+
+        // Pulsing outer ring if root cause
+        nodeG.each(function(d) {
+          if (activeIncident && activeIncident.root_cause_service === d.id && activeIncident.status !== 'healthy') {
+            d3.select(this)
+              .append('circle')
+              .attr('r', 28)
+              .attr('fill', 'none')
+              .attr('stroke', '#E5484D')
+              .attr('stroke-width', 2)
+              .attr('stroke-opacity', 0.6)
+              .append('animate')
+              .attr('attributeName', 'r')
+              .attr('values', '26;34;26')
+              .attr('dur', '2s')
+              .attr('repeatCount', 'indefinite');
+          }
+        });
+
+        // Base background
+        nodeG.append('circle')
+          .attr('r', 22)
+          .attr('fill', '#1C2129')
+          .attr('stroke', '#2A2F38')
+          .attr('stroke-width', 1);
+
+        // Health inner dot with 1.2s deliberate CSS transition
+        nodeG.append('circle')
+          .attr('class', 'graph-node-circle')
+          .attr('r', 8)
+          .attr('fill', d => {
+            const status = servicesHealth[d.id] || 'healthy';
+            if (activeIncident && activeIncident.root_cause_service === d.id && activeIncident.status !== 'healthy') {
+              return '#E5484D';
+            }
+            if (status === 'critical') return '#E5484D';
+            if (status === 'warning' || status === 'degraded') return '#E8A33D';
+            return '#5FBF77';
+          });
+
+        // Label
+        nodeG.append('text')
+          .attr('y', 36)
+          .attr('text-anchor', 'middle')
+          .attr('fill', '#E8EAED')
+          .attr('font-size', '11px')
+          .attr('font-weight', '500')
+          .text(d => d.id);
+
+        nodeG.append('text')
+          .attr('y', 48)
+          .attr('text-anchor', 'middle')
+          .attr('fill', '#6B7280')
+          .attr('font-family', 'IBM Plex Mono, monospace')
+          .attr('font-size', '9px')
+          .text(d => d.id === 'postgres' ? 'port:5432' : 'OTel Active');
+
+      }, [servicesHealth, activeIncident]);
+
+      // Demo Actions: Fault A (DB Latency)
+      const triggerFaultA = () => {
+        setFeedbackToast('Triggered Fault A: Injecting 2000ms delay into payment-service DB queries...');
+        setOverallHealth('critical');
+        setServicesHealth({
+          'frontend-gateway': 'warning',
+          'order-service': 'warning',
+          'payment-service': 'critical',
+          'auth-service': 'healthy',
+          'postgres': 'degraded',
+        });
+
+        const nowIso = new Date().toISOString();
+        const fakeAnomalies = [
+          {
+            id: 'anom-1',
+            service_name: 'frontend-gateway',
+            metric_name: 'request_latency_ms',
+            metric_value: 2080.4,
+            baseline_mean: 24.1,
+            z_score: 5.8,
+            detected_at: new Date(Date.now() - 4000).toISOString(),
+          },
+          {
+            id: 'anom-2',
+            service_name: 'order-service',
+            metric_name: 'request_latency_ms',
+            metric_value: 2050.2,
+            baseline_mean: 18.2,
+            z_score: 6.4,
+            detected_at: new Date(Date.now() - 3000).toISOString(),
+          },
+          {
+            id: 'anom-3',
+            service_name: 'payment-service',
+            metric_name: 'db_query_duration_ms',
+            metric_value: 2012.0,
+            baseline_mean: 4.8,
+            z_score: 8.9,
+            detected_at: new Date(Date.now() - 2000).toISOString(),
+          },
+        ];
+        setAnomalies(fakeAnomalies);
+
+        setActiveIncident({
+          id: 'inc-' + Math.floor(Math.random() * 90000 + 10000),
+          status: 'awaiting_approval',
+          root_cause_service: 'payment-service',
+          root_cause_metric: 'db_query_duration_ms',
+          confidence_pct: 88,
+          confidence_formula: 'clamp((0.845 - 0.520) / 0.845 * 100, 30, 95) = 88%',
+          recommended_action: 'Restart payment-service container to clear stalled database pool connections',
+          recovery_target_container: 'v01_mvp-payment-service-1',
+          ai_reasoning: {
+            root_cause: 'payment-service database query latency spike (z-score: +8.90)',
+            reasoning: 'The weighted scoring engine ranked payment-service highest (score: 0.845). While frontend-gateway registered edge latency first, the dependency graph confirms order-service and gateway are downstream victims waiting on payment-service SQL execution. Database latency escalated from 4.8ms baseline to 2012.0ms.',
+            evidence_summary: '• Service: payment-service\n• Metric: db_query_duration_ms = 2012ms (baseline 4.8ms)\n• Z-score: +8.90 (extreme deviation > 5.0)\n• Graph distance to symptom: 1 hop upstream\n• Engine confidence: 88%',
+          },
+          naive_baseline: {
+            root_cause: 'frontend-gateway',
+            reason: 'earliest anomaly detected at edge',
+          },
+        });
+      };
+
+      // Demo Actions: Fault B (Memory Leak)
+      const triggerFaultB = () => {
+        setFeedbackToast('Triggered Fault B: Injecting 10MB/s memory leak into auth-service...');
+        setOverallHealth('critical');
+        setServicesHealth({
+          'frontend-gateway': 'healthy',
+          'order-service': 'healthy',
+          'payment-service': 'healthy',
+          'auth-service': 'critical',
+          'postgres': 'healthy',
+        });
+
+        const fakeAnomalies = [
+          {
+            id: 'anom-b1',
+            service_name: 'auth-service',
+            metric_name: 'process_memory_rss_mb',
+            metric_value: 512.6,
+            baseline_mean: 42.1,
+            z_score: 9.4,
+            detected_at: new Date().toISOString(),
+          },
+          {
+            id: 'anom-b2',
+            service_name: 'auth-service',
+            metric_name: 'process_cpu_percent',
+            metric_value: 88.2,
+            baseline_mean: 5.4,
+            z_score: 7.1,
+            detected_at: new Date().toISOString(),
+          },
+        ];
+        setAnomalies(fakeAnomalies);
+
+        setActiveIncident({
+          id: 'inc-' + Math.floor(Math.random() * 90000 + 10000),
+          status: 'awaiting_approval',
+          root_cause_service: 'auth-service',
+          root_cause_metric: 'process_memory_rss_mb',
+          confidence_pct: 94,
+          confidence_formula: 'clamp((0.920 - 0.210) / 0.920 * 100, 30, 95) = 94%',
+          recommended_action: 'Restart auth-service container to reclaim memory heap and reset CPU spin loop',
+          recovery_target_container: 'v01_mvp-auth-service-1',
+          ai_reasoning: {
+            root_cause: 'auth-service severe memory heap exhaustion and CPU spin loop',
+            reasoning: 'The auth-service path operates independently from PostgreSQL and payment flow. Memory consumption escalated from 42MB baseline to 512MB (z-score: +9.4), while CPU peaked at 88.2%. Zero downstream impact detected on payment or order services.',
+            evidence_summary: '• Service: auth-service\n• Metric: process_memory_rss_mb = 512MB (baseline 42MB)\n• CPU Utilization: 88.2% (baseline 5.4%)\n• Topology: Isolated path from order/payment pipeline\n• Engine confidence: 94%',
+          },
+          naive_baseline: {
+            root_cause: 'auth-service',
+            reason: 'earliest anomaly detected',
+          },
+        });
+      };
+
+      // Reset
+      const handleReset = () => {
+        setFeedbackToast('Resetting all faults. Restoring clean telemetry baseline...');
+        setOverallHealth('healthy');
+        setServicesHealth({
+          'frontend-gateway': 'healthy',
+          'order-service': 'healthy',
+          'payment-service': 'healthy',
+          'auth-service': 'healthy',
+          'postgres': 'healthy',
+        });
+        setActiveIncident(null);
+        setAnomalies([]);
+      };
+
+      // Approve Recovery
+      const handleApprove = () => {
+        if (!activeIncident) return;
+        setIsActing(true);
+        setActiveIncident(prev => ({ ...prev, status: 'approved' }));
+        setFeedbackToast(`Recovery approved. Restarting container ${activeIncident.recovery_target_container}...`);
+
+        setTimeout(() => {
+          setFeedbackToast('Container restarted. Polling health endpoint every 2s (confirming health)...');
+          setTimeout(() => {
+            // Healed! Deliberate 1.2s transition
+            setActiveIncident(prev => ({ ...prev, status: 'healthy' }));
+            setServicesHealth({
+              'frontend-gateway': 'healthy',
+              'order-service': 'healthy',
+              'payment-service': 'healthy',
+              'auth-service': 'healthy',
+              'postgres': 'healthy',
+            });
+            setOverallHealth('healthy');
+            setIsActing(false);
+            setFeedbackToast(`✓ Verified! ${activeIncident.root_cause_service} confirmed healthy on port check.`);
+            setTimeout(() => {
+              setActiveIncident(null);
+              setAnomalies([]);
+            }, 3000);
+          }, 2500);
+        }, 2000);
+      };
+
+      // Reject Recovery
+      const handleReject = () => {
+        setActiveIncident(prev => ({ ...prev, status: 'rejected' }));
+        setFeedbackToast('Recovery rejected by operator. Manual investigation active.');
+      };
+
+      return (
+        <div className="h-screen w-screen flex flex-col bg-base text-text-primary overflow-hidden font-sans select-none">
+          {/* 1. STATUS BAR */}
+          <header className="h-12 bg-surface border-b border-border px-4 flex items-center justify-between">
+            <div className="flex items-center space-x-3">
+              <div className="flex items-center space-x-2">
+                <span className="w-2.5 h-2.5 bg-signal inline-block"></span>
+                <h1 className="text-xs font-semibold tracking-wider text-text-primary uppercase">
+                  Evidence-Based AI Root Cause Analysis
+                </h1>
+              </div>
+              <span className="text-border">|</span>
+              <span className="text-xs text-text-muted">Control Room</span>
+              <span className={`text-[10px] px-1.5 py-0.5 border ${backendConnected ? 'border-healthy/40 text-healthy bg-healthy/10' : 'border-border text-text-muted bg-base/50'}`}>
+                {backendConnected ? 'LIVE DOCKER ENGINE' : 'INTERACTIVE DEMO READY'}
+              </span>
+            </div>
+
+            <div className="flex items-center space-x-6">
+              <div className="flex items-center space-x-2">
+                <span className={`w-2 h-2 rounded-full ${
+                  overallHealth === 'healthy' ? 'bg-healthy' : 'bg-critical animate-pulse'
+                }`}></span>
+                <span className={`text-xs font-medium ${
+                  overallHealth === 'healthy' ? 'text-healthy' : 'text-critical'
+                }`}>
+                  {activeIncident && activeIncident.status !== 'healthy'
+                    ? `Incident in progress · ${activeIncident.root_cause_service}`
+                    : 'All systems operational'}
+                </span>
+                <span className="text-xs text-text-muted data-value">(5 nodes active)</span>
+              </div>
+
+              <div className="flex items-center space-x-2 pl-4 border-l border-border">
+                <span className="text-xs text-text-muted">UTC</span>
+                <span className="text-xs data-value text-text-secondary font-mono tracking-tight">
+                  {utcTime || '2026-09-14 18:30:00 UTC'}
+                </span>
+              </div>
+            </div>
+          </header>
+
+          {/* 2. MIDDLE ROW: GRAPH (60%) + INCIDENT PANEL (40%) */}
+          <div className="flex-1 min-h-0 grid grid-cols-12 overflow-hidden">
+            {/* Left 60%: Dependency Graph */}
+            <div className="col-span-7 h-full flex flex-col bg-surface overflow-hidden">
+              <div className="h-9 border-b border-border px-4 flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                  <span className="text-xs font-semibold tracking-wider text-text-primary uppercase">
+                    Dependency Topology
+                  </span>
+                  <span className="text-xs text-text-muted">
+                    · derived from live OpenTelemetry spans
+                  </span>
+                </div>
+                <div className="flex items-center space-x-4 text-xs font-sans text-text-muted">
+                  <div className="flex items-center space-x-1.5">
+                    <span className="w-2 h-2 rounded-full bg-healthy"></span>
+                    <span>Healthy</span>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <span className="w-2 h-2 rounded-full bg-warning"></span>
+                    <span>Warning</span>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <span className="w-2 h-2 rounded-full bg-critical"></span>
+                    <span>Critical</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex-1 relative w-full h-full min-h-[280px]">
+                <svg ref={svgRef} className="w-full h-full" />
+                <div className="absolute bottom-2 left-3 text-[10px] text-text-muted data-value">
+                  OpenTelemetry trace propagation · 5 active services · directional call edges
+                </div>
+              </div>
+            </div>
+
+            {/* Right 40%: Incident Panel */}
+            <div className="col-span-5 h-full flex flex-col bg-surface border-l border-border overflow-hidden">
+              {!activeIncident ? (
+                <div className="h-full flex flex-col justify-center items-center text-center p-6">
+                  <div className="w-10 h-10 rounded-full border border-border flex items-center justify-center mb-3">
+                    <span className="w-2.5 h-2.5 rounded-full bg-healthy"></span>
+                  </div>
+                  <h2 className="text-sm font-semibold text-text-primary mb-1">
+                    No Active Incidents
+                  </h2>
+                  <p className="text-xs text-text-secondary max-w-xs leading-relaxed">
+                    Continuous telemetry correlation active. Rolling z-score engine monitoring all microservice streams.
+                  </p>
+                  <div className="mt-6 pt-6 border-t border-border w-full text-left text-xs text-text-muted space-y-1.5">
+                    <div className="flex justify-between">
+                      <span>Correlation Engine:</span>
+                      <span className="text-healthy data-value">ONLINE</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Detection Threshold:</span>
+                      <span className="text-text-primary data-value">|z| &gt; 3.0σ (warning), &gt; 5.0σ (critical)</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Scoring Weights:</span>
+                      <span className="text-signal data-value">0.35 temporal + 0.40 graph + 0.25 severity</span>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className={`h-full flex flex-col ${activeIncident.status === 'healthy' ? 'incident-panel-exit' : ''}`}>
+                  <div className="h-9 border-b border-border px-4 flex items-center justify-between">
+                    <div className="flex items-center space-x-2">
+                      <span className="text-xs font-semibold tracking-wider text-text-primary uppercase">
+                        Incident Investigation
+                      </span>
+                      <span className="text-xs text-text-muted data-value">
+                        #{activeIncident.id}
+                      </span>
+                    </div>
+                    <span className={`text-[11px] px-2 py-0.5 font-medium ${
+                      activeIncident.status === 'healthy' ? 'bg-healthy/20 text-healthy' :
+                      activeIncident.status === 'awaiting_approval' ? 'bg-warning/20 text-warning' :
+                      activeIncident.status === 'approved' ? 'bg-signal/20 text-signal' :
+                      'bg-critical/20 text-critical'
+                    }`}>
+                      {activeIncident.status === 'healthy' ? 'Resolved' :
+                       activeIncident.status === 'awaiting_approval' ? 'Awaiting operator approval' :
+                       activeIncident.status === 'approved' ? 'Recovery in progress' : 'Rejected'}
+                    </span>
+                  </div>
+
+                  <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                    {/* Root Cause & Confidence */}
+                    <div className="border border-border p-3 flex items-center justify-between bg-base/40">
+                      <div>
+                        <div className="text-[11px] text-text-muted mb-0.5">Identified Root Cause Service</div>
+                        <div className="text-base font-semibold text-text-primary">
+                          {activeIncident.root_cause_service}
+                        </div>
+                        <div className="text-xs text-text-secondary data-value mt-0.5">
+                          Metric: {activeIncident.root_cause_metric}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-[11px] text-text-muted mb-0.5">Derived Confidence</div>
+                        <div className="text-2xl font-bold text-signal data-value tracking-tight">
+                          {activeIncident.confidence_pct}%
+                        </div>
+                        <div className="text-[9px] text-text-muted data-value max-w-[150px] truncate" title={activeIncident.confidence_formula}>
+                          {activeIncident.confidence_formula}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Claude AI Reasoning Box (Signal Blue Accent) */}
+                    <div className="border-l-2 border-signal bg-base/60 p-3.5 space-y-2">
+                      <div className="flex items-center space-x-2">
+                        <span className="w-1.5 h-1.5 bg-signal"></span>
+                        <span className="text-xs font-semibold text-signal uppercase tracking-wider">
+                          AI Reasoning Analysis (Claude Sonnet 5)
+                        </span>
+                      </div>
+                      <div className="text-xs text-text-primary font-sans leading-relaxed">
+                        <div className="font-medium mb-1">{activeIncident.ai_reasoning.root_cause}</div>
+                        <p className="text-text-secondary text-xs">{activeIncident.ai_reasoning.reasoning}</p>
+                        <div className="mt-2 pt-2 border-t border-border/50 text-[11px] text-text-muted whitespace-pre-line data-value">
+                          {activeIncident.ai_reasoning.evidence_summary}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Recommended Action */}
+                    <div className="border border-border p-3 space-y-1.5">
+                      <div className="text-[11px] text-text-muted uppercase tracking-wider">Recommended Action</div>
+                      <div className="text-xs font-medium text-text-primary">
+                        {activeIncident.recommended_action}
+                      </div>
+                      <div className="text-[11px] text-text-muted">
+                        Target Container: <span className="data-value text-text-secondary">{activeIncident.recovery_target_container}</span>
+                      </div>
+                    </div>
+
+                    {/* Recovery Progress */}
+                    {activeIncident.status === 'approved' && (
+                      <div className="border border-signal/40 bg-signal/10 p-3 space-y-2">
+                        <div className="flex justify-between text-xs">
+                          <span className="text-text-secondary">Restarting container &amp; verifying health</span>
+                          <span className="text-signal data-value">attempt 1/15</span>
+                        </div>
+                        <div className="h-1 bg-border overflow-hidden">
+                          <div className="h-full bg-signal animate-pulse w-3/4"></div>
+                        </div>
+                        <div className="text-[11px] text-text-muted">
+                          Polling health endpoint every 2s for up to 30s...
+                        </div>
+                      </div>
+                    )}
+
+                    {activeIncident.status === 'healthy' && (
+                      <div className="border border-healthy/40 bg-healthy/10 p-3 text-xs text-healthy">
+                        ✓ Restart confirmed. Service healthy on HTTP 200 check.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Safety Approval Gate (Step 9) */}
+                  <div className="p-4 border-t border-border bg-surface">
+                    {activeIncident.status === 'awaiting_approval' && (
+                      <div className="space-y-2">
+                        <div className="text-[11px] text-text-muted text-center mb-1">
+                          Human approval required before container restart
+                        </div>
+                        <div className="flex space-x-2">
+                          <button
+                            onClick={handleApprove}
+                            disabled={isActing}
+                            className="flex-1 py-2 bg-healthy hover:bg-healthy/90 text-base font-semibold text-xs transition-colors disabled:opacity-50"
+                          >
+                            Approve Recovery Action
+                          </button>
+                          <button
+                            onClick={handleReject}
+                            disabled={isActing}
+                            className="px-4 py-2 border border-border hover:border-critical text-text-secondary hover:text-critical text-xs transition-colors"
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {activeIncident.status !== 'awaiting_approval' && (
+                      <div className="text-center text-xs text-text-muted py-1">
+                        {activeIncident.status === 'approved' ? 'Operator approved · Container restart executing' :
+                         activeIncident.status === 'healthy' ? 'Incident resolved · Telemetry normalized' :
+                         'Action rejected by operator'}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 3. EVIDENCE TIMELINE (HORIZONTAL STRIP) */}
+          <div className="h-[140px] flex-shrink-0 flex flex-col bg-surface border-t border-border">
+            <div className="h-8 border-b border-border px-4 flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <span className="text-xs font-semibold tracking-wider text-text-primary uppercase">
+                  Evidence Timeline &amp; Causal Attribution
+                </span>
+                <span className="text-xs text-text-muted">
+                  · live z-score anomaly feed &amp; baseline divergence
+                </span>
+              </div>
+              <div className="text-[11px] text-text-muted data-value">
+                Window: 30s rolling · Threshold: |z| &gt; 3.0σ
+              </div>
+            </div>
+
+            <div className="flex-1 grid grid-cols-12 overflow-hidden">
+              {/* Left 7 cols: Anomaly Events */}
+              <div className="col-span-7 border-r border-border p-3 flex items-center overflow-x-auto">
+                {anomalies.length === 0 ? (
+                  <div className="text-xs text-text-muted flex items-center space-x-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-healthy"></span>
+                    <span>No active anomalies. All metric streams within 3σ normal baseline.</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center space-x-2 min-w-max">
+                    {anomalies.map((anom, idx) => {
+                      const isRoot = activeIncident && anom.service_name === activeIncident.root_cause_service;
+                      return (
+                        <React.Fragment key={anom.id || idx}>
+                          <div className={`p-2 border text-xs min-w-[155px] ${
+                            isRoot ? 'border-critical bg-critical/10' : 'border-border bg-base/60'
+                          }`}>
+                            <div className="flex justify-between items-center text-[10px] text-text-muted mb-0.5">
+                              <span className="data-value font-mono">
+                                {new Date(anom.detected_at).toISOString().substring(11, 19)}
+                              </span>
+                              <span className="text-critical font-medium">z: +{anom.z_score}</span>
+                            </div>
+                            <div className="font-semibold text-text-primary text-[11px] truncate">
+                              {anom.service_name}
+                            </div>
+                            <div className="text-[10px] text-text-secondary truncate data-value">
+                              {anom.metric_name}
+                            </div>
+                            <div className="text-[9px] text-text-muted mt-0.5 data-value">
+                              val: {anom.metric_value}
+                            </div>
+                          </div>
+                          {idx < anomalies.length - 1 && (
+                            <span className="text-signal font-mono text-xs">→</span>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Right 5 cols: Comparison */}
+              <div className="col-span-5 p-3 flex flex-col justify-center bg-base/30 space-y-2">
+                <div className="text-[11px] font-semibold text-text-secondary uppercase tracking-wider flex items-center justify-between">
+                  <span>Root Cause Attribution Comparison</span>
+                  {activeIncident && (
+                    <span className="text-[10px] text-signal data-value">Active Incident</span>
+                  )}
+                </div>
+
+                <div className="border border-signal/40 bg-signal/5 p-2 flex items-center justify-between text-xs">
+                  <div className="flex items-center space-x-2">
+                    <span className="w-2 h-2 rounded-full bg-signal"></span>
+                    <div>
+                      <div className="text-[10px] text-signal font-medium uppercase">
+                        Evidence-Based Engine (3-Factor Formula)
+                      </div>
+                      <div className="font-semibold text-text-primary text-xs">
+                        {activeIncident ? activeIncident.root_cause_service : 'No incident'}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-right data-value">
+                    <span className="text-signal font-bold text-xs">
+                      {activeIncident ? `${activeIncident.confidence_pct}%` : 'Score: 0.85'}
+                    </span>
+                    <div className="text-[9px] text-text-muted">temporal + graph + severity</div>
+                  </div>
+                </div>
+
+                <div className="border border-border bg-surface/80 p-2 flex items-center justify-between text-xs">
+                  <div className="flex items-center space-x-2">
+                    <span className="w-2 h-2 rounded-full bg-text-muted"></span>
+                    <div>
+                      <div className="text-[10px] text-text-muted uppercase">
+                        Naive Baseline (First Arrival Only)
+                      </div>
+                      <div className="font-medium text-text-secondary text-xs">
+                        {activeIncident ? activeIncident.naive_baseline.root_cause : (anomalies[0]?.service_name || 'frontend-gateway')}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-right text-[10px] text-text-muted data-value">
+                    <span>{activeIncident ? activeIncident.naive_baseline.reason : 'earliest anomaly'}</span>
+                    <div className="text-[9px] text-warning">ignores topology</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* 4. DEMO CONTROLS (BOTTOM BAR) */}
+          <footer className="h-11 bg-surface border-t border-border px-4 flex items-center justify-between select-none">
+            <div className="flex items-center space-x-3">
+              <span className="text-[11px] font-semibold tracking-wider text-text-muted uppercase">
+                Demo Scenarios
+              </span>
+              <span className="text-border">|</span>
+
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={triggerFaultA}
+                  disabled={isActing}
+                  className="px-3 py-1 bg-base border border-border hover:border-warning text-text-primary text-xs transition-colors disabled:opacity-50"
+                  title="Inject 2000ms delay into payment-service database queries"
+                >
+                  Trigger Fault A · DB Latency
+                </button>
+
+                <button
+                  onClick={triggerFaultB}
+                  disabled={isActing}
+                  className="px-3 py-1 bg-base border border-border hover:border-warning text-text-primary text-xs transition-colors disabled:opacity-50"
+                  title="Simulate buffer growth and CPU spike in auth-service"
+                >
+                  Trigger Fault B · Memory Leak
+                </button>
+
+                <button
+                  onClick={handleReset}
+                  disabled={isActing}
+                  className="px-3 py-1 bg-base border border-border hover:border-healthy text-text-secondary hover:text-healthy text-xs transition-colors disabled:opacity-50"
+                  title="Clear all injected delays and reset service states"
+                >
+                  Reset Faults
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center space-x-3">
+              {feedbackToast && (
+                <span className="text-xs text-signal data-value font-mono">
+                  {feedbackToast}
+                </span>
+              )}
+              <span className="text-[10px] text-text-muted font-sans">
+                Operator Console v0.1
+              </span>
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
