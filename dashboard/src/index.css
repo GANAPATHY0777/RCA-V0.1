@@ -1,0 +1,104 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   DESIGN SYSTEM — Evidence-Based RCA Control Room
+   
+   Background base: #14171C (deep graphite)
+   Panel/surface: #1C2129, 1px hairline borders (#2A2F38)
+   Health: #5FBF77, Warning: #E8A33D, Critical: #E5484D
+   AI accent: #5B8DEF (signal blue)
+   Typography: Inter (UI) + IBM Plex Mono (data values)
+   No rounded cards, no shadows — structural hairline dividers only
+   ============================================================ */
+
+:root {
+  --color-base: #14171C;
+  --color-surface: #1C2129;
+  --color-border: #2A2F38;
+  --color-healthy: #5FBF77;
+  --color-warning: #E8A33D;
+  --color-critical: #E5484D;
+  --color-signal: #5B8DEF;
+  --color-text-primary: #E8EAED;
+  --color-text-secondary: #9AA0A8;
+  --color-text-muted: #6B7280;
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-base);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Data values always use mono */
+.data-value {
+  font-family: var(--font-mono);
+}
+
+/* Status color utilities */
+.status-healthy { color: var(--color-healthy); }
+.status-warning { color: var(--color-warning); }
+.status-critical { color: var(--color-critical); }
+.status-signal { color: var(--color-signal); }
+
+/* Health dot indicator */
+.health-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.health-dot.healthy { background-color: var(--color-healthy); }
+.health-dot.degraded, .health-dot.warning { background-color: var(--color-warning); }
+.health-dot.critical, .health-dot.unhealthy, .health-dot.unreachable { background-color: var(--color-critical); }
+
+/* The ONE deliberate transition: node color change on incident resolve */
+.graph-node-circle {
+  transition: fill 1.2s ease-in-out;
+}
+
+/* Incident panel fade out on resolve */
+.incident-panel-exit {
+  animation: fadeOut 0.8s ease-in-out forwards;
+}
+
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-base);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+}
+
+/* Timeline styling */
+.timeline-connector {
+  stroke: var(--color-signal);
+  stroke-width: 2;
+  stroke-dasharray: 4 2;
+}
