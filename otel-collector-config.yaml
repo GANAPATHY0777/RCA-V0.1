@@ -1,0 +1,37 @@
+# OpenTelemetry Collector Configuration
+# Receives traces and metrics from all services via OTLP
+# Exports to the analysis engine's custom ingestion endpoint
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 2s
+    send_batch_size: 100
+
+exporters:
+  otlphttp/spans:
+    endpoint: http://analysis-engine:3020
+    traces_endpoint: http://analysis-engine:3020/api/telemetry/spans
+    tls:
+      insecure: true
+
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/spans, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
